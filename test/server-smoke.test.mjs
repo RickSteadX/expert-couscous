@@ -101,6 +101,7 @@ test('responds to initialize and tools/list over stdio', async () => {
       'downloads_events_ack',
       'downloads_list',
       'downloads_scan',
+      'downloads_sort',
       'downloads_undo',
       'watcher_status'
     ]);

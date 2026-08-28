@@ -220,20 +220,93 @@ export function createFsx({ root, logger }) {
     return { from: abs, to };
   }
 
-  /** Move a file back out of the trash (spec §6.1 downloads_undo). */
-  async function restoreFromTrash(from, to) {
+  /**
+   * Move a file to another directory *within* the root, for theme sorting.
+   *
+   * Same-device by construction, like the trash move, so the rename is atomic. Both ends
+   * go through the jail, and neither may be the trash: sorting is not a way to delete,
+   * and untrashing is downloads_undo's job.
+   * @returns {Promise<{from: string, to: string}>}
+   */
+  async function moveWithinRoot(from, destDirRel) {
+    const src = resolveJailed(from);
+    const destDir = resolveJailed(destDirRel);
+    if (isInTrash(src)) {
+      throw new JanitorError(Codes.INVALID_INPUT, 'Cannot sort a file that is in the trash.', { from });
+    }
+    if (isInTrash(destDir)) {
+      throw new JanitorError(Codes.INVALID_INPUT, 'Cannot sort a file into the trash.', { to: destDirRel });
+    }
+    let st;
+    try {
+      st = await fsp.stat(src);
+    } catch {
+      throw new JanitorError(Codes.NOT_FOUND, `No such file: ${from}`, { from });
+    }
+    if (!st.isFile()) {
+      throw new JanitorError(Codes.INVALID_INPUT, `Not a regular file: ${from}`, { from });
+    }
+
+    await fsp.mkdir(destDir, { recursive: true });
+    const to = await uniqueDestination(destDir, path.basename(src));
+    try {
+      await fsp.rename(src, to);
+    } catch (err) {
+      throw new JanitorError(Codes.INTERNAL, `Could not move file: ${err.code}`, { from });
+    }
+    return { from: src, to };
+  }
+
+  /** Immediate subdirectories of the root, so a caller can see the theme folders that exist. */
+  async function listFolders() {
+    const base = getRealRoot();
+    let entries;
+    try {
+      entries = await fsp.readdir(base, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    return entries
+      .filter((e) => e.isDirectory() && e.name !== TRASH_DIRNAME)
+      .map((e) => e.name)
+      .sort();
+  }
+
+  /**
+   * Reverse a recorded move (spec §6.1 downloads_undo).
+   *
+   * Deliberately not trash-specific: a manifest can record a move into the trash
+   * (clean, dedupe) or a move into a theme folder (sort), and undo has to reverse both.
+   * The guard that matters is on the destination — undo must never put a file *into* the
+   * trash — plus the jail on both ends.
+   */
+  async function restoreMove(from, to) {
     const src = resolveJailed(from);
     const dest = resolveJailed(to);
-    if (!isInTrash(src)) {
-      throw new JanitorError(Codes.INVALID_INPUT, 'Restore source is not inside the trash.', { from });
-    }
     if (isInTrash(dest)) {
       throw new JanitorError(Codes.INVALID_INPUT, 'Restore destination is inside the trash.', { to });
     }
     await fsp.mkdir(path.dirname(dest), { recursive: true });
     const finalDest = await uniqueDestination(path.dirname(dest), path.basename(dest));
     await fsp.rename(src, finalDest);
+    await pruneIfEmpty(path.dirname(src));
     return { from: src, to: finalDest };
+  }
+
+  /**
+   * Remove a directory the undo has just emptied — a trash day-partition or a theme
+   * folder — so undoing a sort leaves no hollow folders behind. Never touches the root
+   * or the trash root itself.
+   */
+  async function pruneIfEmpty(dir) {
+    const base = getRealRoot();
+    if (dir === base || dir === trashRoot() || !contains(base, dir)) return;
+    try {
+      const rest = await fsp.readdir(dir);
+      if (rest.length === 0) await fsp.rmdir(dir);
+    } catch {
+      /* not empty, or gone already */
+    }
   }
 
   /**
@@ -366,7 +439,9 @@ export function createFsx({ root, logger }) {
     isInTrash,
     walk,
     atomicMoveToTrash,
-    restoreFromTrash,
+    moveWithinRoot,
+    listFolders,
+    restoreMove,
     listTrash,
     emptyTrash,
     ensureNoMedia

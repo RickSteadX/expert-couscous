@@ -211,14 +211,20 @@ test('emptyTrash deletes only inside the trash and respects the age cutoff', asy
   }
 });
 
-test('restore moves a file back out of the trash', async () => {
+test('restoreMove reverses a recorded move and prunes the emptied directory', async () => {
   const box = makeSandbox();
   try {
     const fsx = createFsx({ root: box.root });
     const moved = await fsx.atomicMoveToTrash('sub/b.txt');
-    const back = await fsx.restoreFromTrash(moved.to, path.join(box.root, 'sub', 'b.txt'));
+    const back = await fsx.restoreMove(moved.to, path.join(box.root, 'sub', 'b.txt'));
     assert.equal(fs.readFileSync(back.to, 'utf8'), 'b');
     assert.equal(fs.existsSync(moved.to), false);
+    assert.equal(fs.existsSync(path.dirname(moved.to)), false, 'the emptied day partition is pruned');
+    assert.ok(fs.existsSync(fsx.trashRoot()), 'but the trash root itself survives');
+
+    // Undo must never be a route back into the trash.
+    fs.writeFileSync(path.join(box.root, 'c.txt'), 'c');
+    await assert.rejects(() => fsx.restoreMove(path.join(box.root, 'c.txt'), path.join(fsx.trashRoot(), 'c.txt')));
   } finally {
     box.cleanup();
   }

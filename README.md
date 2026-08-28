@@ -14,11 +14,12 @@ device before setup can succeed.
 | Core boilerplate (`src/core/`, `src/server.mjs`) | implemented |
 | `setup.sh --doctor` preflight | implemented |
 | `downloads-janitor` add-on (spec §6) | implemented |
+| Theme sorting (`downloads_sort`) | implemented, extends the spec |
 | Watcher-facing tools (spec §7.5) | implemented, inert until the watcher runs |
 | `setup.sh` install/update path (spec §9 steps 2–10) | not yet |
 | `watcher.mjs` | not yet |
 
-The server mounts nine tools today. `downloads_events`, `downloads_events_ack`, and
+The server mounts ten tools today. `downloads_events`, `downloads_events_ack`, and
 `watcher_status` are wired to the queue and snapshot files the watcher will write, so they
 answer honestly (empty queue, service not running) until `watcher.mjs` lands.
 
@@ -28,6 +29,7 @@ answer honestly (empty queue, service not running) until `watcher.mjs` lands.
 |---|---|
 | `downloads_scan` — totals by category and age, largest files, likely duplicates, trash size | no |
 | `downloads_list` — filtered listing, largest first | no |
+| `downloads_sort` — file loose downloads into themed subfolders from a plan you author | moves only |
 | `downloads_clean` — move a selector's matches to the trash | trash only |
 | `downloads_dedupe` — size-gated, hash-confirmed duplicate removal, keeps the oldest | trash only |
 | `downloads_undo` — restore a batch from its manifest | restores |
@@ -37,6 +39,37 @@ answer honestly (empty queue, service not running) until `watcher.mjs` lands.
 
 Both mutating tools default to `dryRun: true`, and the default is applied by the core
 before the handler runs, so an omitted argument can never arrive as `undefined`.
+
+## Sorting by theme
+
+`downloads_sort` is an addition to the spec: the janitor files things as well as cleans
+them. The themes are **decided by the model, not by the server** — there is no built-in
+"invoices" heuristic. The flow is:
+
+1. `downloads_scan` or `downloads_list` to see what is there, plus which theme folders
+   already exist (`folders` and `looseFiles` in the scan output, so a second run reuses
+   `Tax 2026` rather than inventing `Taxes 2026` beside it).
+2. Submit a plan — folder name, the files that belong in it, and an optional one-line
+   reason echoed back in the dry run.
+3. Dry run first, then `dryRun:false`, exactly like `downloads_clean`.
+
+```jsonc
+{ "plan": [
+    { "folder": "Tax 2026", "paths": ["invoice-jan.pdf", "payslip-mar.pdf"],
+      "reason": "financial records for the 2026 tax year" },
+    { "folder": "Photos/Summer trip", "paths": ["IMG_20260714_beach.jpg"] }
+] }
+```
+
+Files land in subfolders **inside** `Download/`, which keeps every move a same-device
+rename (atomic) and keeps one path jail. A sort is recorded in the same manifest format as
+a clean, so `downloads_undo` restores the flat layout and prunes the folders it emptied.
+
+Folder names are validated as strictly as paths: no traversal, no absolute paths, no
+leading dots (which is also what keeps a plan out of `.janitor-trash`), and none of the
+characters that are invalid on the FAT-like emulated volume. Protected patterns block
+sorting just as they block cleaning, and re-running an identical plan is a no-op rather
+than a churn of `-1` suffixes.
 
 Two behaviours worth knowing, because neither is stated in the spec:
 

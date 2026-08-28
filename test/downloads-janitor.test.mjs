@@ -440,3 +440,203 @@ test('tools report STORAGE_NOT_GRANTED when the root is missing', async () => {
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+// --- sorting ------------------------------------------------------------------
+
+test('sort defaults to a dry run and groups the plan by folder', async () => {
+  const box = sandbox({
+    'invoice-jan.pdf': { size: 100 },
+    'invoice-feb.pdf': { size: 100 },
+    'beach.jpg': { size: 200 }
+  });
+  try {
+    // No dryRun argument: the default must arrive as true, same as clean and dedupe.
+    const preview = await call('downloads_sort', {
+      plan: [
+        { folder: 'Tax 2026', paths: ['invoice-jan.pdf', 'invoice-feb.pdf'], reason: 'invoices for the tax year' },
+        { folder: 'Holiday photos', paths: ['beach.jpg'] }
+      ]
+    });
+    assert.equal(preview.dryRun, true);
+    assert.equal(preview.wouldMove, 3);
+    assert.equal(preview.folders.length, 2);
+    assert.equal(preview.folders[0].reason, 'invoices for the tax year');
+    assert.ok(fs.existsSync(path.join(box.root, 'invoice-jan.pdf')), 'dry run must not move anything');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort files into themed folders and undo restores the flat layout', async () => {
+  const box = sandbox({ 'invoice-jan.pdf': { size: 100 }, 'beach.jpg': { size: 200 } });
+  try {
+    const result = await call('downloads_sort', {
+      plan: [
+        { folder: 'Tax 2026', paths: ['invoice-jan.pdf'] },
+        { folder: 'Photos/2026', paths: ['beach.jpg'] }
+      ],
+      dryRun: false
+    });
+    assert.equal(result.moved, 2);
+    assert.ok(fs.existsSync(path.join(box.root, 'Tax 2026', 'invoice-jan.pdf')));
+    assert.ok(fs.existsSync(path.join(box.root, 'Photos', '2026', 'beach.jpg')), 'nested folders are allowed to maxSortFolderDepth');
+    assert.equal(fs.existsSync(path.join(box.root, 'invoice-jan.pdf')), false);
+
+    // Sorted files must still be visible to the other tools.
+    const scan = await call('downloads_scan');
+    assert.equal(scan.totalFiles, 2, 'sorted files stay in the inventory');
+    assert.equal(scan.looseFiles, 0);
+    assert.deepEqual(scan.folders.map((f) => f.folder).sort(), ['Photos', 'Tax 2026']);
+
+    const undo = await call('downloads_undo', { manifestId: result.manifestId });
+    assert.equal(undo.restored, 2);
+    assert.ok(fs.existsSync(path.join(box.root, 'invoice-jan.pdf')), 'undo puts the flat layout back');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('re-running the same sort plan is a no-op rather than churning suffixes', async () => {
+  const box = sandbox({ 'invoice-jan.pdf': { size: 100 } });
+  try {
+    const plan = [{ folder: 'Tax 2026', paths: ['invoice-jan.pdf'] }];
+    await call('downloads_sort', { plan, dryRun: false });
+
+    const again = await call('downloads_sort', {
+      plan: [{ folder: 'Tax 2026', paths: ['Tax 2026/invoice-jan.pdf'] }],
+      dryRun: false
+    });
+    assert.equal(again.moved, 0);
+    assert.deepEqual(again.skipped.alreadyPlaced, [path.join('Tax 2026', 'invoice-jan.pdf')]);
+    assert.equal(fs.readdirSync(path.join(box.root, 'Tax 2026')).length, 1, 'no invoice-jan-1.pdf');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort rejects hostile and unusable folder names', async () => {
+  const box = sandbox({ 'a.jpg': { size: 10 } });
+  try {
+    const hostile = [
+      '../escape',
+      '../../etc',
+      '/etc/passwd',
+      '.janitor-trash',
+      '.hidden',
+      'a/b/c/d',
+      'bad:name',
+      'bad|name',
+      'trailing ',
+      'trailing.',
+      ''
+    ];
+    for (const folder of hostile) {
+      await assert.rejects(
+        () => call('downloads_sort', { plan: [{ folder, paths: ['a.jpg'] }], dryRun: false }),
+        (err) => {
+          assert.ok(
+            [Codes.PATH_ESCAPE, Codes.INVALID_INPUT].includes(err.code),
+            `folder ${JSON.stringify(folder)} gave ${err.code}`
+          );
+          return true;
+        },
+        `folder ${JSON.stringify(folder)} should have been rejected`
+      );
+    }
+    assert.ok(fs.existsSync(path.join(box.root, 'a.jpg')), 'nothing moved');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort will not move protected files or files outside the root', async () => {
+  const box = sandbox(
+    { 'invoice-2026.pdf': { size: 100 }, 'junk.pdf': { size: 100 } },
+    { protect: ['invoice*'] }
+  );
+  try {
+    const result = await call('downloads_sort', {
+      plan: [{ folder: 'Documents', paths: ['invoice-2026.pdf', 'junk.pdf'] }],
+      dryRun: false
+    });
+    assert.equal(result.moved, 1);
+    assert.deepEqual(result.skipped.protected, ['invoice-2026.pdf']);
+    assert.ok(fs.existsSync(path.join(box.root, 'invoice-2026.pdf')), 'protected file stays put');
+
+    await assert.rejects(
+      () => call('downloads_sort', { plan: [{ folder: 'Documents', paths: ['../outside.txt'] }], dryRun: false }),
+      (err) => {
+        assert.equal(err.code, Codes.PATH_ESCAPE);
+        return true;
+      }
+    );
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort handles name collisions, duplicate plan entries, and missing files', async () => {
+  const box = sandbox({ 'report.pdf': { content: 'one' }, 'sub/report.pdf': { content: 'two' } });
+  try {
+    const result = await call('downloads_sort', {
+      plan: [
+        { folder: 'Docs', paths: ['report.pdf', 'sub/report.pdf', 'report.pdf', 'ghost.pdf'] }
+      ],
+      dryRun: false
+    });
+    assert.equal(result.moved, 2);
+    assert.deepEqual(result.skipped.duplicatePlan, ['report.pdf']);
+    assert.deepEqual(result.skipped.missing, ['ghost.pdf']);
+
+    const filed = fs.readdirSync(path.join(box.root, 'Docs')).sort();
+    assert.deepEqual(filed, ['report-1.pdf', 'report.pdf'], 'same-named files from different folders both survive');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort refuses to file anything into the trash', async () => {
+  const box = sandbox({ 'a.jpg': { size: 10 } });
+  try {
+    await assert.rejects(
+      () => call('downloads_sort', { plan: [{ folder: '.janitor-trash/2026-01-01', paths: ['a.jpg'] }], dryRun: false }),
+      (err) => {
+        assert.ok([Codes.PATH_ESCAPE, Codes.INVALID_INPUT].includes(err.code));
+        return true;
+      }
+    );
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('sort respects the batch cap', async () => {
+  const files = {};
+  for (let i = 0; i < 12; i++) files[`f${i}.jpg`] = { size: 10 };
+  const box = sandbox(files, { maxBatchFiles: 5 });
+  try {
+    await assert.rejects(
+      () => call('downloads_sort', { plan: [{ folder: 'Photos', paths: Object.keys(files) }] }),
+      (err) => {
+        assert.equal(err.code, Codes.BATCH_LIMIT);
+        return true;
+      }
+    );
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('cleaning still works on files that have been sorted into subfolders', async () => {
+  const box = sandbox({ 'old.apk': { size: 100, ageDays: 200 } });
+  try {
+    await call('downloads_sort', { plan: [{ folder: 'Installers', paths: ['old.apk'] }], dryRun: false });
+    const cleaned = await call('downloads_clean', {
+      selector: { category: 'apk', olderThanDays: 90 },
+      dryRun: false
+    });
+    assert.equal(cleaned.trashed, 1, 'category selectors still match inside theme folders');
+  } finally {
+    box.cleanup();
+  }
+});

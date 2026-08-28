@@ -41,7 +41,8 @@ const configSchema = {
     maxBatchFiles: { type: 'integer', minimum: 1, default: 500 },
     maxBatchBytes: { type: 'integer', minimum: 1, default: 5_368_709_120 },
     protect: { type: 'array', items: { type: 'string' }, default: [] },
-    categories: { type: 'object', default: {} }
+    categories: { type: 'object', default: {} },
+    maxSortFolderDepth: { type: 'integer', minimum: 1, maximum: 3, default: 2 }
   }
 };
 
@@ -222,6 +223,64 @@ function run(command, args, timeoutMs = 5000) {
   });
 }
 
+/**
+ * Validate a destination folder supplied by the model.
+ *
+ * This is the sorting equivalent of the path jail: a folder name reaches us as untrusted
+ * text and is about to become a directory inside the user's storage. `resolveJailed`
+ * would catch traversal on its own, but rejecting it here gives the model a message it
+ * can act on instead of a generic escape error, and it also rules out names that are
+ * legal on Linux but break on the FAT-like emulated volume.
+ */
+function validateSortFolder(folder) {
+  if (typeof folder !== 'string' || folder.trim().length === 0) {
+    throw new JanitorError(Codes.INVALID_INPUT, 'Each plan entry needs a non-empty folder name.');
+  }
+  if (folder.includes('\0')) {
+    throw new JanitorError(Codes.PATH_ESCAPE, 'Folder name contains a null byte.', { folder });
+  }
+  if (path.isAbsolute(folder)) {
+    throw new JanitorError(Codes.PATH_ESCAPE, `Folder must be relative to the Downloads root: '${folder}'.`, { folder });
+  }
+
+  const segments = folder.split('/').filter((seg) => seg.length > 0);
+  const { maxSortFolderDepth } = config();
+  if (segments.length === 0 || segments.length > maxSortFolderDepth) {
+    throw new JanitorError(
+      Codes.INVALID_INPUT,
+      `Folder '${folder}' must have between 1 and ${maxSortFolderDepth} path segments.`,
+      { folder }
+    );
+  }
+  for (const seg of segments) {
+    if (seg === '.' || seg === '..') {
+      throw new JanitorError(Codes.PATH_ESCAPE, `Folder '${folder}' must not contain '.' or '..'.`, { folder });
+    }
+    if (seg.startsWith('.')) {
+      // Also what keeps a plan out of .janitor-trash.
+      throw new JanitorError(Codes.INVALID_INPUT, `Folder segments must not start with a dot: '${seg}'.`, { folder });
+    }
+    if (/[<>:"\\|?*\x00-\x1f]/.test(seg)) {
+      throw new JanitorError(
+        Codes.INVALID_INPUT,
+        `Folder '${seg}' contains characters that are not valid on Android shared storage (< > : " \\ | ? *).`,
+        { folder }
+      );
+    }
+    if (seg !== seg.trim() || seg.endsWith('.')) {
+      throw new JanitorError(
+        Codes.INVALID_INPUT,
+        `Folder '${seg}' must not start or end with a space, or end with a dot — those are unreliable on FAT-like storage.`,
+        { folder }
+      );
+    }
+    if (seg.length > 64) {
+      throw new JanitorError(Codes.INVALID_INPUT, `Folder segment '${seg}' is longer than 64 characters.`, { folder });
+    }
+  }
+  return segments.join('/');
+}
+
 // --- tools --------------------------------------------------------------------
 
 const tools = [
@@ -268,8 +327,20 @@ const tools = [
       const trash = await ctx.fsx.listTrash(0);
       const trashBytes = trash.reduce((sum, t) => sum + t.size, 0);
 
+      // Existing theme folders, so a sort can reuse them instead of inventing a second
+      // name for the same theme on every run.
+      const folderNames = await ctx.fsx.listFolders();
+      const folders = folderNames.map((name) => {
+        const inFolder = files.filter((f) => f.rel === path.join(name, path.basename(f.rel)) || f.rel.startsWith(`${name}${path.sep}`));
+        const bytes = inFolder.reduce((sum, f) => sum + f.size, 0);
+        return { folder: name, files: inFolder.length, bytes, human: formatBytes(bytes) };
+      });
+      const looseFiles = files.filter((f) => !f.rel.includes(path.sep)).length;
+
       return {
         root: config().root,
+        folders,
+        looseFiles,
         totalFiles: files.length,
         totalBytes,
         totalHuman: formatBytes(totalBytes),
@@ -492,7 +563,7 @@ const tools = [
       const failed = [];
       for (const move of manifest.moves) {
         try {
-          const back = await ctx.fsx.restoreFromTrash(move.to, move.from);
+          const back = await ctx.fsx.restoreMove(move.to, move.from);
           restored.push(path.relative(ctx.fsx.getRealRoot(), back.to));
         } catch (err) {
           failed.push({ path: move.from, error: err.message });
@@ -551,6 +622,133 @@ const tools = [
         freedBytes: result.bytes,
         freedHuman: formatBytes(result.bytes),
         note: 'Permanently deleted. downloads_undo can no longer restore these.'
+      };
+    }
+  },
+
+  {
+    name: 'downloads_sort',
+    description:
+      "File loose downloads into themed subfolders inside Downloads. You decide the themes: call downloads_scan or downloads_list first to see what is there and which folders already exist, then submit a plan mapping folder names to the files that belong in them. Themes can be anything meaningful to the user — 'Tax 2026', 'Holiday photos', 'Work PDFs' — not just file types. Defaults to a dry run.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan: {
+          type: 'array',
+          description: 'One entry per destination folder.',
+          items: {
+            type: 'object',
+            properties: {
+              folder: {
+                type: 'string',
+                description: "Destination folder relative to the Downloads root, e.g. 'Invoices' or 'Photos/2026'."
+              },
+              paths: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Paths relative to the Downloads root, as returned by downloads_list.'
+              },
+              reason: { type: 'string', description: 'Optional one-line note on why these belong together; echoed back in the dry run.' }
+            },
+            required: ['folder', 'paths']
+          }
+        },
+        dryRun: { type: 'boolean', default: true }
+      },
+      required: ['plan'],
+      additionalProperties: false
+    },
+    handler: async ({ plan, dryRun }) => {
+      if (plan.length === 0) {
+        throw new JanitorError(Codes.INVALID_INPUT, 'The plan is empty. Give at least one folder with at least one file.');
+      }
+
+      const root = ctx.fsx.getRealRoot();
+      const moves = [];
+      const skipped = { protected: [], alreadyPlaced: [], missing: [], duplicatePlan: [] };
+      const seen = new Set();
+
+      for (const entry of plan) {
+        const folder = validateSortFolder(entry.folder);
+        for (const p of entry.paths) {
+          const abs = ctx.fsx.resolveJailed(p); // PATH_ESCAPE on anything outside the root
+          const rel = path.relative(root, abs);
+
+          // A file named twice in one plan would otherwise be moved, then "moved" again
+          // from a path that no longer exists.
+          if (seen.has(abs)) {
+            skipped.duplicatePlan.push(rel);
+            continue;
+          }
+          seen.add(abs);
+
+          if (isProtected(rel)) {
+            skipped.protected.push(rel);
+            continue;
+          }
+          let st;
+          try {
+            st = await fsp.stat(abs);
+          } catch {
+            skipped.missing.push(rel);
+            continue;
+          }
+          if (!st.isFile()) {
+            skipped.missing.push(rel);
+            continue;
+          }
+          if (path.dirname(rel) === folder) {
+            // Re-running the same plan must be a no-op, not a churn of -1 suffixes.
+            skipped.alreadyPlaced.push(rel);
+            continue;
+          }
+          moves.push({ abs, rel, size: st.size, folder, to: path.join(folder, path.basename(rel)), reason: entry.reason });
+        }
+      }
+
+      enforceBatchLimit(moves, 'downloads_sort');
+
+      if (dryRun) {
+        const byFolder = {};
+        for (const m of moves) {
+          (byFolder[m.folder] ??= { files: [], bytes: 0, reason: m.reason }).files.push(m.rel);
+          byFolder[m.folder].bytes += m.size;
+        }
+        return {
+          dryRun: true,
+          wouldMove: moves.length,
+          folders: Object.entries(byFolder).map(([folder, v]) => ({
+            folder,
+            files: v.files,
+            bytes: v.bytes,
+            human: formatBytes(v.bytes),
+            reason: v.reason
+          })),
+          skipped,
+          next: 'Call downloads_sort again with dryRun:false to file these. Nothing is deleted — undo restores the original layout.'
+        };
+      }
+
+      const done = [];
+      const failed = [];
+      for (const move of moves) {
+        try {
+          done.push(await ctx.fsx.moveWithinRoot(move.abs, move.folder));
+        } catch (err) {
+          failed.push({ path: move.rel, error: err.message });
+        }
+      }
+      const manifest = await writeManifest('downloads_sort', done);
+      ctx.logger.info('sorted', { moved: done.length, folders: new Set(moves.map((m) => m.folder)).size, manifestId: manifest.id });
+
+      return {
+        dryRun: false,
+        manifestId: manifest.id,
+        moved: done.length,
+        folders: [...new Set(moves.map((m) => m.folder))].sort(),
+        skipped,
+        failed,
+        note: `Nothing was deleted — files were filed into subfolders. Undo the whole batch with downloads_undo manifestId:"${manifest.id}".`
       };
     }
   },
