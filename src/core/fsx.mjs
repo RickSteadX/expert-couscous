@@ -236,7 +236,24 @@ export function createFsx({ root, logger }) {
     return { from: src, to: finalDest };
   }
 
-  /** List trash entries older than N days, without deleting. Powers the dry run. */
+  /**
+   * When a file entered the trash, derived from the `<ISO-date>/` partition it sits in.
+   *
+   * A rename preserves mtime, so a download from 200 days ago still has a 200-day-old
+   * mtime the instant it is trashed. Dating retention off mtime would therefore purge it
+   * on the very next empty_trash call and destroy the undo window — the opposite of what
+   * a retention period is for. The date directory is the only record of when we moved it.
+   */
+  function trashedAtMs(relFromTrash, fallbackMtimeMs) {
+    const [day] = relFromTrash.split(path.sep);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      const parsed = Date.parse(`${day}T00:00:00Z`);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    return fallbackMtimeMs;
+  }
+
+  /** List trash entries trashed more than N days ago, without deleting. Powers the dry run. */
   async function listTrash(olderThanDays = 0) {
     const base = trashRoot();
     if (!fs.existsSync(base)) return [];
@@ -257,8 +274,11 @@ export function createFsx({ root, logger }) {
           stack.push(abs);
         } else if (entry.isFile() && entry.name !== '.nomedia') {
           const st = await fsp.stat(abs).catch(() => null);
-          if (st && st.mtimeMs <= cutoff) {
-            out.push({ abs, rel: path.relative(base, abs), size: st.size, mtimeMs: st.mtimeMs });
+          if (!st) continue;
+          const rel = path.relative(base, abs);
+          const trashedAt = trashedAtMs(rel, st.mtimeMs);
+          if (trashedAt <= cutoff) {
+            out.push({ abs, rel, size: st.size, mtimeMs: st.mtimeMs, trashedAtMs: trashedAt });
           }
         }
       }

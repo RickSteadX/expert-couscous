@@ -13,12 +13,39 @@ device before setup can succeed.
 |---|---|
 | Core boilerplate (`src/core/`, `src/server.mjs`) | implemented |
 | `setup.sh --doctor` preflight | implemented |
+| `downloads-janitor` add-on (spec §6) | implemented |
+| Watcher-facing tools (spec §7.5) | implemented, inert until the watcher runs |
 | `setup.sh` install/update path (spec §9 steps 2–10) | not yet |
-| `downloads-janitor` add-on | not yet |
 | `watcher.mjs` | not yet |
 
-The server starts and completes an MCP handshake today, but registers no tools until the
-first add-on lands.
+The server mounts nine tools today. `downloads_events`, `downloads_events_ack`, and
+`watcher_status` are wired to the queue and snapshot files the watcher will write, so they
+answer honestly (empty queue, service not running) until `watcher.mjs` lands.
+
+## Tools
+
+| Tool | Mutates? |
+|---|---|
+| `downloads_scan` — totals by category and age, largest files, likely duplicates, trash size | no |
+| `downloads_list` — filtered listing, largest first | no |
+| `downloads_clean` — move a selector's matches to the trash | trash only |
+| `downloads_dedupe` — size-gated, hash-confirmed duplicate removal, keeps the oldest | trash only |
+| `downloads_undo` — restore a batch from its manifest | restores |
+| `downloads_empty_trash` — the only permanent delete, needs `confirm:true` | **deletes** |
+| `downloads_events` / `downloads_events_ack` — the watcher's new-file queue | queue only |
+| `watcher_status` — service state, last poll, queue depth, Termux:API presence | no |
+
+Both mutating tools default to `dryRun: true`, and the default is applied by the core
+before the handler runs, so an omitted argument can never arrive as `undefined`.
+
+Two behaviours worth knowing, because neither is stated in the spec:
+
+- **An empty selector is refused.** `downloads_clean` with `{}` would otherwise match every
+  file, one `dryRun:false` away from emptying the folder.
+- **Trash retention is dated from when a file was trashed**, read from the
+  `.janitor-trash/<date>/` partition — not from its mtime, which a rename preserves. Dating
+  off mtime would purge a six-month-old download the instant it was trashed and destroy the
+  undo window.
 
 ## Quick start
 

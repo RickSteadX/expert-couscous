@@ -90,9 +90,24 @@ test('responds to initialize and tools/list over stdio', async () => {
     assert.equal(listed.id, 2);
     assert.ok(Array.isArray(listed.result.tools), 'tools/list must return an array');
 
-    // No add-ons are bundled yet, so this is empty — but the loader must have said so
-    // on stderr rather than failing the handshake.
-    assert.match(server.stderr, /no tools registered/);
+    // The bundled downloads-janitor add-on must be mounted end-to-end, with every tool
+    // carrying the JSON Schema the model needs to call it.
+    const names = listed.result.tools.map((t) => t.name).sort();
+    assert.deepEqual(names, [
+      'downloads_clean',
+      'downloads_dedupe',
+      'downloads_empty_trash',
+      'downloads_events',
+      'downloads_events_ack',
+      'downloads_list',
+      'downloads_scan',
+      'downloads_undo',
+      'watcher_status'
+    ]);
+    for (const t of listed.result.tools) {
+      assert.equal(t.inputSchema.type, 'object', `${t.name} must declare an object inputSchema`);
+      assert.ok(t.description.length > 0, `${t.name} must have a description`);
+    }
   } finally {
     server.stop();
   }
@@ -135,6 +150,32 @@ test('an unknown tool returns a coded error result, not a crash', async () => {
     const payload = JSON.parse(res.result.content[0].text);
     assert.equal(payload.code, 'UNKNOWN_TOOL');
     assert.match(payload.message, /No such tool/);
+  } finally {
+    server.stop();
+  }
+});
+
+test('a real tool call without the storage grant returns an actionable error', async () => {
+  const server = startServer({ JANITOR__DOWNLOADS_JANITOR__ROOT: '/nonexistent/storage/downloads' });
+  try {
+    server.send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } }
+    });
+    await server.nextLine();
+    server.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    server.send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'downloads_scan', arguments: {} } });
+
+    const res = JSON.parse(await server.nextLine());
+    assert.equal(res.result.isError, true);
+    const payload = JSON.parse(res.result.content[0].text);
+    assert.equal(payload.code, 'STORAGE_NOT_GRANTED');
+    assert.match(payload.message, /termux-setup-storage/);
+    // Names the configured root, which also proves the env override reached the add-on's
+    // config section rather than the tool merely failing on the default.
+    assert.match(payload.message, /\/nonexistent\/storage\/downloads/);
   } finally {
     server.stop();
   }

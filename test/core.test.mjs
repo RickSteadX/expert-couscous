@@ -202,3 +202,22 @@ test('loader skips an add-on whose config section fails its own schema', async (
     assert.deepEqual(skipped, ['strict-addon']);
   });
 });
+
+test('the generic env form addresses a kebab-case add-on section', () => {
+  const addonSchemas = {
+    'downloads-janitor': {
+      type: 'object',
+      properties: {
+        root: { type: 'string', default: '~/storage/downloads' },
+        maxBatchFiles: { type: 'integer', minimum: 1, default: 500 }
+      }
+    }
+  };
+  const cfg = loadConfig({
+    file: '/nonexistent/config.json',
+    env: { JANITOR__DOWNLOADS_JANITOR__ROOT: '/tmp/elsewhere' },
+    addonSchemas
+  });
+  assert.equal(cfg['downloads-janitor'].root, '/tmp/elsewhere');
+  assert.equal(cfg['downloads-janitor'].maxBatchFiles, 500, 'other keys keep their defaults');
+});

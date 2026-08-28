@@ -101,9 +101,19 @@ function applyEnv(config, env) {
   for (const [key, target] of Object.entries(ENV_MAP)) {
     if (env[key] !== undefined) setPath(out, target, coerce(env[key]));
   }
+  // Generic form: JANITOR__<SECTION>__<KEY>, e.g.
+  // JANITOR__DOWNLOADS_JANITOR__ROOT sets config['downloads-janitor'].root.
+  // Segments are lowercased and underscores become hyphens, which is what add-on section
+  // names look like. camelCase keys cannot be addressed this way — those are what the
+  // explicit ENV_MAP above is for.
   for (const [key, value] of Object.entries(env)) {
     if (!key.startsWith('JANITOR_') || !key.includes('__') || key in ENV_MAP) continue;
-    const segments = key.slice('JANITOR_'.length).split('__').map((s) => s.toLowerCase());
+    const segments = key
+      .slice('JANITOR'.length)
+      .split('__')
+      .filter((s) => s.length > 0)
+      .map((s) => s.toLowerCase().replace(/_/g, '-'));
+    if (segments.length === 0) continue;
     setPath(out, segments, coerce(value));
   }
   return out;
