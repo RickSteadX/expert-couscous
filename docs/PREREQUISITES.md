@@ -150,33 +150,77 @@ Spec §9 step 7 reads:
 > If `claude` is not on PATH, `npm install -g @anthropic-ai/claude-code`.
 
 **This does not work on Termux as written**, and it is the highest-risk item in the
-whole setup. Two separate failures:
+whole setup. Anthropic ships Claude Code as a **glibc-linked Linux ARM64 binary** with no
+Android build; Termux runs on Android's **bionic** libc. Separately, npm rejects the
+package with `Unsupported platform: android arm64`, and the npm distribution no longer
+exposes a global `claude` bin entry.
 
-1. **`Unsupported platform: android arm64`** — npm refuses the install outright.
-2. Even when installed, Claude Code's **vendored ripgrep** at
-   `.../vendor/ripgrep/arm64-android/rg` fails to spawn. The official native binary is
-   built against glibc; Android uses bionic.
+### 3.1 The four options, and which one this project needs
 
-Three known-working paths, in increasing cost:
+| | Option | Mechanism | Cost | Verdict for the janitor |
+|---|---|---|---|---|
+| **A** | **Patched native binary** | Download the official linux-arm64 build, `patchelf` its ELF interpreter to point at Termux `glibc-runner`'s `ld-linux-aarch64.so.1`, install a wrapper at `$PREFIX/bin/claude` | ~233 MB binary + ~50 MB `glibc-runner`/`patchelf-glibc` | **Recommended.** Runs in the Termux filesystem namespace, so `~/storage/downloads` is directly visible, stdio MCP works, and directory walks run at full speed |
+| **B** | **npm + alias** (Node path) | `npm install -g @anthropic-ai/claude-code`, then alias `claude` to `$(npm root -g)/@anthropic-ai/claude-code/cli.js` | ~300 MB, reuses the `nodejs-lts` this project already requires | Viable fallback; no third-party installer to trust. Most brittle across Claude Code releases |
+| **C** | **`proot-distro` Ubuntu** | Real glibc userland inside Termux; Anthropic's official `claude.ai/install.sh` runs unmodified | ~2 GB | **Avoid for this project** — see §3.2 |
+| **D** | **AVF Linux VM** (Android 16+, Pixel 6+/select S26) | Android's built-in hypervisor, Debian guest, no Termux | — | **Disqualifying.** The VM has its own filesystem and no access to `/storage/emulated/0`, so the janitor has nothing to clean |
 
-| Path | What it is | Disk | Trade-off |
-|---|---|---|---|
-| **A — patched native binary** | Fetch the official `linux-arm64` build, patch its ELF interpreter for bionic, wrap it | few hundred MB | Fastest, but a patched binary needs re-patching on every Claude Code update |
-| **B — `proot-distro` Ubuntu** | Real glibc userland inside Termux; use Anthropic's official installer there | ~2 GB | Most robust; `process.platform` reports `linux`. **But the MCP server then runs inside proot**, so `~/storage/downloads` must be bind-visible and the path jail must resolve through the proot mount — a design consequence, not just an install detail |
-| **C — npm + alias/wrapper** | `npm install -g` with platform checks bypassed, then alias `claude` to the module entry point, plus `pkg install ripgrep` and point Claude Code at the system `rg` | ~300 MB | Lightest; most brittle across Claude Code releases |
+Confirmed for options A and B: **MCP stdio transport works**. Remote HTTP works too;
+OAuth-based MCP servers are the unreliable case (they depend on the Android browser
+reaching a localhost callback). The janitor is stdio, so this is not a concern.
 
-**Recommendations for the spec:**
+### 3.2 Why proot (option C) is the wrong choice *here* specifically
+
+It is the most "officially supported looking" path, which makes it tempting, but it
+conflicts with two of the spec's own design points:
+
+1. **The path jail moves.** The MCP server would be spawned inside the Ubuntu rootfs, so
+   `~/storage/downloads` is not visible without an explicit bind
+   (`proot-distro login ubuntu --bind /storage/emulated/0:/mnt/downloads`). §5.3
+   `resolveJailed()` would then have to jail against the *bind target*, and the
+   config's `"root": "~/storage/downloads"` default becomes wrong. Verify the exact
+   bind behaviour on-device before committing to this.
+2. **proot intercepts syscalls.** Every `readdir`/`stat` is traced, which is exactly the
+   workload `downloads_scan` (§6.1) and the watcher's 30 s poll (§7.1) are built from.
+   Acceptance criterion 2 budgets < 10 s for ≥ 1 000 files; proot overhead eats directly
+   into that budget, on top of the FUSE emulation layer already in the path.
+
+### 3.3 Option A caveats worth knowing before you commit
+
+- **DNS is forced to Google.** The wrapper preloads a resolver shim
+  (`BUN_OPTIONS="--preload …setdns.js"`) pinning Bun's c-ares resolver to `8.8.8.8` /
+  `8.8.4.4`. If you run a VPN, Pi-hole, or corporate DNS, Claude's own lookups bypass it.
+- **`LD_PRELOAD` is cleared** before exec to avoid a conflict with `libtermux-exec`.
+- **Android 8/10 devices fail the seccomp filter** and are pinned to an older release.
+  Not a problem at the spec's Android 11+ floor.
+- The installer's "recommended packages" set includes `proot-distro`, `make`, `clang`,
+  `python` (~200 MB). Decline it if you want to keep the no-native-toolchain property
+  from §2 — the janitor needs none of them.
+- It is a **third-party installer**. It does verify the binary's SHA256 against
+  Anthropic's published manifest, but the patching wrapper is community-maintained.
+
+### 3.4 Option B caveats
+
+- The vendored ripgrep at `vendor/ripgrep/arm64-android/rg` fails to spawn. Fix:
+  `pkg install ripgrep` and `export USE_BUILTIN_RIPGREP=0` **in `~/.bashrc`**, not just
+  in the current session — the variable is reported as ignored when set only in
+  `settings.json`.
+- The alias is shell-level, so **Claude Code launched from anywhere that is not an
+  interactive bash session will not find `claude`**. Prefer a real wrapper script in
+  `$PREFIX/bin/claude` over an alias.
+
+### 3.5 What `setup.sh` should do about all this
 
 - Change §9 step 7 from "install it" to **"detect it, verify it actually runs
-  (`claude --version` with a timeout), and if absent print the chosen path's
-  instructions and exit with a dedicated code"**. Bundling a Claude Code installer
-  inside a janitor setup script means owning someone else's upgrade treadmill.
+  (`timeout 10 claude --version`), and if absent print the chosen path's instructions
+  and exit with a dedicated code."** Bundling someone else's installer inside a janitor
+  setup script means owning their upgrade treadmill.
 - Add exit code **15 = Claude Code missing or non-functional**, distinct from 13
-  (registration failure). Right now a broken CLI surfaces as a confusing 13.
-- If path B is chosen, that decision propagates into §5.3 `fsx.mjs` and must be
-  recorded in the spec, not discovered at implementation time.
-- Verify **`claude mcp add` grammar against the installed version** before shipping.
-  The spec's flag ordering note (§9 step 8) is right in spirit; pin it to a version and
+  (registration failure). Today a broken CLI surfaces as a confusing 13.
+- If option C is ever chosen, that decision propagates into §5.3 `fsx.mjs` and the
+  config default root, and must be recorded in the spec rather than discovered at
+  implementation time.
+- Verify **`claude mcp add` grammar against the installed version** before shipping. The
+  spec's flag-ordering note (§9 step 8) is right in spirit; pin it to a version and
   re-check, since remove-then-add is only idempotent if both subcommands exist.
 
 Also note: `claude mcp add --scope user` writes to `~/.claude.json` and works
@@ -184,8 +228,6 @@ unauthenticated, but the spec's step 10 smoke test (`claude mcp list` reporting
 *connected*) **starts a session and therefore requires auth**. Split the smoke test into
 a registration check (works offline) and a connection check (requires login), so an
 unauthenticated first run reports amber, not red.
-
----
 
 ## 4. Tier 3 — Project-side prerequisites
 
