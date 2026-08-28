@@ -15,13 +15,14 @@ device before setup can succeed.
 | `setup.sh --doctor` preflight | implemented |
 | `downloads-janitor` add-on (spec §6) | implemented |
 | Theme sorting (`downloads_sort`) | implemented, extends the spec |
-| Watcher-facing tools (spec §7.5) | implemented, inert until the watcher runs |
-| `setup.sh` install/update path (spec §9 steps 2–10) | not yet |
-| `watcher.mjs` | not yet |
+| Watcher service (`src/watcher.mjs`, spec §7) | implemented |
+| Watcher-facing tools (spec §7.5) | implemented |
+| `setup.sh` install / update / uninstall (spec §9) | implemented |
 
-The server mounts ten tools today. `downloads_events`, `downloads_events_ack`, and
-`watcher_status` are wired to the queue and snapshot files the watcher will write, so they
-answer honestly (empty queue, service not running) until `watcher.mjs` lands.
+Feature-complete against the spec for v1, plus theme sorting. Not yet validated on a
+physical Samsung device — the Termux-specific paths (package install, storage grant,
+`sv`, Termux:API, Termux:Boot) are written against the documented behaviour but have only
+been exercised off-device.
 
 ## Tools
 
@@ -80,16 +81,43 @@ Two behaviours worth knowing, because neither is stated in the spec:
   off mtime would purge a six-month-old download the instant it was trashed and destroy the
   undo window.
 
-## Quick start
+## Install
+
+On the phone, in Termux:
 
 ```sh
-./setup.sh --doctor   # read-only: verifies every prerequisite, changes nothing
-npm ci --omit=dev
-npm test
+git clone https://github.com/RickSteadX/expert-couscous.git ~/janitor-mcp
+cd ~/janitor-mcp
+./setup.sh --doctor   # read-only: check prerequisites first
+./setup.sh            # install, or update an existing install
 ```
 
-`--doctor` exits non-zero on the first blocking problem and prints the fix. Exit codes are
-listed at the top of `setup.sh`.
+`setup.sh` is idempotent — re-running it updates. It installs packages, requests the
+storage grant, runs `npm ci`, seeds the config (never overwriting an existing one),
+registers the server with Claude Code at user scope, sets up the `janitor-watcher`
+service, drops a Termux:Boot script, and finishes with a smoke test.
+
+| Flag | Effect |
+|---|---|
+| *(none)* | install or update |
+| `--doctor` | read-only preflight, changes nothing |
+| `--from-dir DIR` | install from a local tree instead of cloning (offline) |
+| `--uninstall` | unregister and remove the service; config, logs and trash are kept |
+
+Exit codes are listed at the top of `setup.sh`; `--doctor` exits non-zero on the first
+blocking problem and prints the fix.
+
+**`setup.sh` does not install Claude Code.** It detects it and stops with instructions if
+it is missing, because a plain `npm install -g` does not produce a working CLI on Android
+and bundling a third-party installer here would mean owning its upgrade treadmill. See
+[`docs/PREREQUISITES.md` §3](docs/PREREQUISITES.md).
+
+## Development
+
+```sh
+npm ci --omit=dev
+npm test          # 69 tests, no device required
+```
 
 ## Installing Claude Code in Termux
 
@@ -116,6 +144,40 @@ src/
 Two files are additions to the spec's §4 layout: `errors.mjs` (the §10 codes needed a
 home) and `schema.mjs` (the add-on contract declares plain JSON Schema, so the core needs
 a validator; using it for config validation too avoids a second mechanism).
+
+## The watcher
+
+`src/watcher.mjs` runs under termux-services, independent of any Claude Code session, and
+tells the next session what arrived while it was away.
+
+It polls rather than using inotify: Android's shared storage is exposed through a
+FUSE/emulation layer that does not reliably deliver inotify events to Termux, so
+`inotifywait` silently misses arrivals on many devices. Every 30 seconds it lists the
+Downloads tree and diffs `{size, mtime}` against a snapshot persisted in the state
+directory — which is also why files that landed while the phone was off still show up as
+new on the next start.
+
+Three behaviours worth knowing:
+
+- **A new file is only announced once its size is unchanged across two polls.** That is
+  the debounce for in-progress downloads; `*.crdownload`, `*.part` and `*.tmp` are ignored
+  outright at any size.
+- **The very first run adopts what is already there as the baseline** rather than
+  announcing every file you have ever downloaded.
+- **It never writes inside `Download/`.** It calls only the read side of `fsx`; every
+  write goes to the state directory. Auto-rules can *tag* an event (`"rule": "big-video"`)
+  and nothing more — all mutation stays behind the tools' dry-run flow, where a human is
+  in the loop. This is asserted by a test.
+
+Events land in `~/.local/state/janitor-mcp/events.jsonl`, and the queue is the only
+contract between the watcher and the server: an MCP stdio server cannot push messages on
+its own, so the two processes never talk directly and either runs happily without the
+other. Read them with `downloads_events`, clear them with `downloads_events_ack`, and
+check on the service with `watcher_status`.
+
+Notifications go through `termux-notification`. If the Termux:API app is missing the step
+is skipped and the queue still works — but note the probe uses a timeout rather than
+`command -v`, because the CLI package without the app *blocks* rather than failing.
 
 ## Two rules that are easy to break
 

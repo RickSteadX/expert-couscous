@@ -210,6 +210,9 @@ conflicts with two of the spec's own design points:
 
 ### 3.5 What `setup.sh` should do about all this
 
+> **Implemented.** `setup.sh` now detects and verifies rather than installing, and exits
+> 15 with the option-A instructions when Claude Code is missing or non-functional.
+
 - Change §9 step 7 from "install it" to **"detect it, verify it actually runs
   (`timeout 10 claude --version`), and if absent print the chosen path's instructions
   and exit with a dedicated code."** Bundling someone else's installer inside a janitor
