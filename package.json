@@ -1,0 +1,22 @@
+{
+  "name": "termux-mcp-janitor",
+  "version": "1.0.0",
+  "description": "Modular local MCP server for Claude Code in Termux, with a Downloads-folder janitor add-on.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "janitor-mcp": "src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "doctor": "./setup.sh --doctor"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  },
+  "license": "MIT"
+}

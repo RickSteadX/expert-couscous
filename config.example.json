@@ -1,0 +1,22 @@
+{
+  "disabledAddons": [],
+  "log": { "level": "info" },
+  "watcher": {
+    "enabled": true,
+    "pollSeconds": 30,
+    "notify": true,
+    "wakeLock": true,
+    "ignore": ["*.crdownload", "*.part", "*.tmp"],
+    "autoRules": [
+      { "name": "big-video", "match": { "category": "video", "largerThanMB": 300 } }
+    ]
+  },
+  "downloads-janitor": {
+    "root": "~/storage/downloads",
+    "trashRetentionDays": 7,
+    "maxBatchFiles": 500,
+    "maxBatchBytes": 5368709120,
+    "protect": [],
+    "categories": {}
+  }
+}
